@@ -5,6 +5,13 @@ import { applyDrag } from '../src/lib/solver';
 import { planTwoPointSync } from '../src/lib/sync';
 import { planMerge, joinBilingualText } from '../src/lib/merge';
 import { planExcerpt, rewriteTimestampTags } from '../src/lib/excerpt';
+import {
+  planCueWrap,
+  planSmartWrap,
+  tokenizeCueText,
+  visibleLineWidth,
+  graphemeWidth,
+} from '../src/lib/wrap';
 import { detectIssues } from '../src/lib/issues';
 import {
   parseCueSettings,
@@ -722,6 +729,199 @@ cid-7
   assert.strictEqual(cs[0].start, 0);
   assert.strictEqual(cs[0].locked, true);
   ok('摘录：输入 cue 与文本不被修改');
+}
+
+// ---------- 智能分行 ----------
+
+// 37. 字素宽度：中文/全角计 2、其他计 1；标签与时间戳标签不计宽；行尾空格不计
+{
+  assert.strictEqual(graphemeWidth('你'), 2);
+  assert.strictEqual(graphemeWidth('A'), 1);
+  assert.strictEqual(graphemeWidth('，'), 2);
+  assert.strictEqual(graphemeWidth(' '), 1);
+  assert.strictEqual(graphemeWidth('👍'), 2);
+  assert.strictEqual(visibleLineWidth('<b>你好</b>'), 4);
+  assert.strictEqual(visibleLineWidth('<00:01.500>你好'), 4);
+  assert.strictEqual(visibleLineWidth('hello '), 5); // 行尾空格不计
+  assert.strictEqual(visibleLineWidth('a<v Bob>c'), 2);
+  // 无法配对的 < 视为普通字素
+  const toks = tokenizeCueText('a < b');
+  assert.ok(toks.some((t) => t.text === '<' && !t.tag));
+  assert.strictEqual(visibleLineWidth('a < b'), 5);
+  ok('智能分行：字素宽度规则与标签不计宽');
+}
+
+// 38. 基本两行拆分：优先减少两行宽差；总宽不超上限时已符合
+{
+  const r = planCueWrap('你好世界平和', 8);
+  assert.ok(r.kind === 'suggest');
+  assert.strictEqual(r.text, '你好世\n界平和');
+  assert.deepStrictEqual(r.lineWidths, [6, 6]);
+  // 总宽恰好等于上限 → 已符合，不改动
+  assert.strictEqual(planCueWrap('你好世界', 8).kind, 'ok');
+  // 确定性：相同输入重复求解结果一致
+  const again = planCueWrap('你好世界平和', 8);
+  assert.ok(again.kind === 'suggest' && again.text === r.text);
+  ok('智能分行：两行拆分宽差最小且确定');
+}
+
+// 39. 空格断点：空格留在行尾且不计宽；仅插入换行，其余字符保留
+{
+  const r = planCueWrap('hello world', 8);
+  assert.ok(r.kind === 'suggest');
+  assert.strictEqual(r.text, 'hello \nworld');
+  assert.deepStrictEqual(r.lineWidths, [5, 5]);
+  assert.strictEqual(r.text.replace(/\n/g, ''), 'hello world');
+  ok('智能分行：空格断点且其余字符保留');
+}
+
+// 40. 闭合标点禁止出现在行首
+{
+  const r = planCueWrap('你好，世界', 6);
+  assert.ok(r.kind === 'suggest');
+  assert.strictEqual(r.text, '你好，\n世界'); // 在标点后断，而不是让「，」落到行首
+  assert.deepStrictEqual(r.lineWidths, [6, 4]);
+
+  const bad = planCueWrap('你好，世界', 5);
+  assert.strictEqual(bad.kind, 'unsolvable');
+  assert.ok(bad.kind === 'unsolvable' && bad.reason.includes('标点'));
+  ok('智能分行：闭合标点不出现在行首');
+}
+
+// 41. 开放标点禁止出现在行尾
+{
+  const r = planCueWrap('他说「你好」', 8);
+  assert.ok(r.kind === 'suggest');
+  assert.strictEqual(r.text, '他说\n「你好」'); // 不在「之后断（开放标点不留行尾）
+  assert.deepStrictEqual(r.lineWidths, [4, 8]);
+
+  const bad = planCueWrap('他说「你好」', 6);
+  assert.strictEqual(bad.kind, 'unsolvable');
+  assert.ok(bad.kind === 'unsolvable' && bad.reason.includes('标点'));
+  ok('智能分行：开放标点不出现在行尾');
+}
+
+// 42. 无解原因：单字素超宽 / 需要超过两行
+{
+  const wide = planCueWrap('你好', 1);
+  assert.strictEqual(wide.kind, 'unsolvable');
+  assert.ok(wide.kind === 'unsolvable' && wide.reason.includes('单字素超宽') && wide.reason.includes('你'));
+
+  const long = planCueWrap('你好世界', 3);
+  assert.strictEqual(long.kind, 'unsolvable');
+  assert.ok(long.kind === 'unsolvable' && long.reason.includes('超过两行') && long.reason.includes('3 行'));
+  ok('智能分行：单字素超宽与超过两行的无解原因');
+}
+
+// 43. 已符合不改动；多行重排为不超过两行（仅增删换行）
+{
+  assert.strictEqual(planCueWrap('你好\n世界', 4).kind, 'ok'); // 两行均不超宽：不动
+  assert.strictEqual(planCueWrap('你好', 4).kind, 'ok');
+  // 三行但总宽一行放得下：仅删除换行合并为单行
+  const join = planCueWrap('你\n好\n世', 6);
+  assert.ok(join.kind === 'suggest');
+  assert.strictEqual(join.text, '你好世');
+  // 三行重排为两行
+  const two = planCueWrap('你好\n世界\n平和', 6);
+  assert.ok(two.kind === 'suggest');
+  assert.strictEqual(two.text, '你好世\n界平和');
+  assert.deepStrictEqual(two.kind === 'suggest' ? two.lineWidths : [], [6, 6]);
+  ok('智能分行：已符合不改动，多行仅增删换行重排');
+}
+
+// 44. 标签不可拆开；配对标签优先不跨行；时间戳标签保持完整
+{
+  const r = planCueWrap('<b>你好</b>世界', 4);
+  assert.ok(r.kind === 'suggest');
+  assert.strictEqual(r.text, '<b>你好</b>\n世界'); // 优先在配对标签之外断
+  assert.deepStrictEqual(r.lineWidths, [4, 4]);
+
+  // 必须在标签对内断行时，标签本身保持完整（换行不会落在 <...> 内部）
+  const inner = planCueWrap('<b>你好世界</b>', 4);
+  assert.ok(inner.kind === 'suggest');
+  assert.strictEqual(inner.text, '<b>你好\n世界</b>');
+  for (const line of inner.text.split('\n')) {
+    assert.strictEqual((line.match(/</g) || []).length, (line.match(/>/g) || []).length);
+  }
+
+  const ts = planCueWrap('<00:01.000>你好<00:02.000>世界', 4);
+  assert.ok(ts.kind === 'suggest');
+  assert.strictEqual(ts.text, '<00:01.000>你好\n<00:02.000>世界');
+  ok('智能分行：标签原子化、配对标签优先不跨行、时间戳标签完整');
+}
+
+// 45. 不变量：建议文本仅增删换行，其余字符逐字保留；至多一个换行；每行不超宽
+{
+  const samples = ['你好世界', 'hello world foo', '<b>你好</b>世界平和', '他说「你好」', 'a < b > c', '你\n好\n世\n界'];
+  for (const s of samples) {
+    for (const mw of [1, 2, 3, 5, 8, 13]) {
+      const r = planCueWrap(s, mw);
+      if (r.kind !== 'suggest') continue;
+      assert.strictEqual(r.text.replace(/\n/g, ''), s.replace(/\n/g, ''));
+      assert.ok((r.text.match(/\n/g) || []).length <= 1);
+      assert.ok(r.lineWidths.length <= 2 && r.lineWidths.every((w) => w <= mw));
+    }
+  }
+  ok('智能分行：建议仅增删换行且每行不超宽');
+}
+
+// 46. 批量计划：锁定片段跳过；确认语义只改文本，其余字段原样保留
+{
+  const cs: Cue[] = [
+    { id: 'a', identifier: 'id-a', start: 0, end: 2, text: '你好世界平和', settings: 'line:90%', locked: false },
+    { id: 'b', identifier: '', start: 2, end: 4, text: '短', settings: '', locked: true },
+    { id: 'c', identifier: '', start: 4, end: 6, text: '你好', settings: '', locked: false },
+    { id: 'd', identifier: '', start: 6, end: 8, text: '你好世界平和啊', settings: '', locked: false },
+  ];
+  const snapshot = JSON.parse(JSON.stringify(cs));
+  const plan = planSmartWrap(cs, 6);
+  assert.deepStrictEqual(cs, snapshot); // 输入不被修改
+  assert.strictEqual(plan.items.length, 3); // 锁定的不参与
+  assert.strictEqual(plan.lockedCount, 1);
+  assert.strictEqual(plan.suggestCount, 1);
+  assert.strictEqual(plan.okCount, 1);
+  assert.strictEqual(plan.unsolvableCount, 1); // d 可见宽度 14 > 2×6，需要超过两行
+  const sug = plan.items.find((i) => i.id === 'a')!;
+  assert.ok(sug.result.kind === 'suggest');
+  // 模拟确认写入：仅替换 text，时间/标识符/设置/锁定状态原样保留
+  const newText = sug.result.kind === 'suggest' ? sug.result.text : '';
+  const applied = cs.map((c) => (c.id === 'a' ? { ...c, text: newText } : c));
+  assert.strictEqual(applied[0].text, '你好世\n界平和');
+  assert.strictEqual(applied[0].identifier, 'id-a');
+  assert.strictEqual(applied[0].settings, 'line:90%');
+  assert.deepStrictEqual([applied[0].start, applied[0].end], [0, 2]);
+  assert.strictEqual(applied[1].text, '短'); // 锁定片段不动
+  assert.strictEqual(applied[0].text.replace(/\n/g, ''), cs[0].text.replace(/\n/g, ''));
+  ok('智能分行：锁定跳过；确认仅改文本，其余字段保留');
+}
+
+// 47. 导出集成：建议文本可直接序列化，标识符/设置/文件头/时间码保留，可再解析
+{
+  const v = `WEBVTT
+
+NOTE 分行保留头
+
+cid-9
+00:01.000 --> 00:04.000 line:90% align:middle
+<b>你好世界平和</b>
+`;
+  const p = parseVTT(v);
+  assert.ok(!p.error, p.error);
+  const cue = p.cues[0];
+  const r = planCueWrap(cue.text, 6);
+  assert.ok(r.kind === 'suggest');
+  const newText = r.kind === 'suggest' ? r.text : '';
+  assert.strictEqual(newText, '<b>你好世\n界平和</b>');
+  const out = serializeVTT([{ ...cue, text: newText }], p.preamble);
+  assert.ok(out.includes('NOTE 分行保留头'));
+  assert.ok(out.includes('cid-9'));
+  assert.ok(out.includes('00:01.000 --> 00:04.000 line:90% align:middle'));
+  assert.ok(out.includes('<b>你好世\n界平和</b>'));
+  const re = parseVTT(out);
+  assert.ok(!re.error, re.error);
+  assert.strictEqual(re.cues[0].text, newText);
+  assert.strictEqual(re.cues[0].settings, 'line:90% align:middle');
+  ok('智能分行：建议文本可导出并再解析，设置/标识符/文件头保留');
 }
 
 console.log(`\n全部 ${passed} 组测试通过 ✅`);
