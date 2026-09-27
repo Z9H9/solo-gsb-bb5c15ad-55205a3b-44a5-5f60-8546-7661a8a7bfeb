@@ -5,6 +5,7 @@ import { applyDrag } from '../src/lib/solver';
 import { planTwoPointSync } from '../src/lib/sync';
 import { planMerge, joinBilingualText } from '../src/lib/merge';
 import { planExcerpt, rewriteTimestampTags } from '../src/lib/excerpt';
+import { suggestWrap, planSmartWrap, visibleWidth } from '../src/lib/wrap';
 import { detectIssues } from '../src/lib/issues';
 import {
   parseCueSettings,
@@ -722,6 +723,247 @@ cid-7
   assert.strictEqual(cs[0].start, 0);
   assert.strictEqual(cs[0].locked, true);
   ok('摘录：输入 cue 与文本不被修改');
+}
+
+// ---------- 智能分行 ----------
+
+function cueObj(id: string, text: string, locked = false): Cue {
+  return { id, identifier: '', start: 0, end: 2, text, settings: '', locked };
+}
+
+// 37. 行宽：中文及全角计 2、其余计 1；标签/时间戳标签不计；行缘空白不计
+{
+  assert.strictEqual(visibleWidth('你好'), 4);
+  assert.strictEqual(visibleWidth('ab'), 2);
+  assert.strictEqual(visibleWidth('ＡＢ'), 4); // 全角 ASCII（FF21/FF22）
+  assert.strictEqual(visibleWidth('<b>你好</b>'), 4);
+  assert.strictEqual(visibleWidth('<v Bob>你好</v>'), 4);
+  assert.strictEqual(visibleWidth('<00:01.500>你好'), 4); // 时间戳标签不计宽
+  assert.strictEqual(visibleWidth('a b'), 3); // 内部空格计 1
+  assert.strictEqual(visibleWidth('ab '), 2); // 行尾空白不计
+  assert.strictEqual(visibleWidth('  ab'), 2); // 行首空白不计
+  assert.strictEqual(visibleWidth('你好，世界'), 10);
+  ok('智能分行：可见字素宽度（标签不计、行缘空白不计）');
+}
+
+// 38. 两行断点：优先最小化两行宽差（等宽差时取位置靠前者）
+{
+  const r = suggestWrap('大家好欢迎收看本期节目', 12); // 11 个宽字素，共 22
+  assert.strictEqual(r.ok, true);
+  if (r.ok) {
+    assert.strictEqual(r.suggestion.text, '大家好欢迎\n收看本期节目'); // 10 + 12
+    assert.deepStrictEqual(r.suggestion.lineWidths, [10, 12]);
+  }
+  ok('智能分行：优先减少两行宽差');
+}
+
+// 39. 空格处断行优先；空格保留在行尾（不删除任何字符）
+{
+  const r = suggestWrap('hello world', 8);
+  assert.strictEqual(r.ok, true);
+  if (r.ok) {
+    assert.strictEqual(r.suggestion.text, 'hello \nworld');
+    assert.deepStrictEqual(r.suggestion.lineWidths, [5, 5]);
+  }
+  // 连续空白只在整个空白 run 之后断（第二行不以空白开头）
+  const r2 = suggestWrap('aa  bb', 3);
+  assert.strictEqual(r2.ok, true);
+  if (r2.ok) assert.strictEqual(r2.suggestion.text, 'aa  \nbb');
+  ok('智能分行：空格断点优先且空白保留');
+}
+
+// 40. 闭合标点不得出现在行首（断点必须在标点之后）
+{
+  const r = suggestWrap('你好，世界啊', 7); // 共 12
+  assert.strictEqual(r.ok, true);
+  if (r.ok) {
+    assert.strictEqual(r.suggestion.text, '你好，\n世界啊'); // 6 + 6
+    assert.ok(!r.suggestion.text.split('\n')[1].startsWith('，'));
+  }
+  ok('智能分行：闭合标点不出现在行首');
+}
+
+// 41. 开放标点不得出现在行尾
+{
+  const r = suggestWrap('他说《红楼》好', 8); // 共 14
+  assert.strictEqual(r.ok, true);
+  if (r.ok) {
+    // 中点 6/8 会把「《」留在行尾（非法），合法最优为 8 + 6
+    assert.strictEqual(r.suggestion.text, '他说《红\n楼》好');
+    assert.deepStrictEqual(r.suggestion.lineWidths, [8, 6]);
+    assert.ok(!r.suggestion.text.split('\n')[0].endsWith('《'));
+  }
+  ok('智能分行：开放标点不出现在行尾');
+}
+
+// 42. 内联标签与时间戳标签不计宽、不可拆开，标签旁的禁则仍按可见字素判断
+{
+  const r = suggestWrap('<b>你好世界</b>', 5);
+  assert.strictEqual(r.ok, true);
+  if (r.ok) assert.strictEqual(r.suggestion.text, '<b>你好\n世界</b>');
+
+  const r2 = suggestWrap('<00:01.000>你好世界', 5);
+  assert.strictEqual(r2.ok, true);
+  if (r2.ok) assert.strictEqual(r2.suggestion.text, '<00:01.000>你好\n世界');
+
+  // 标签不拆开：<00:01.000> 始终完整出现
+  const r3 = suggestWrap('你<00:01.000>好世界', 5);
+  assert.strictEqual(r3.ok, true);
+  if (r3.ok) {
+    assert.strictEqual(r3.suggestion.text, '你<00:01.000>好\n世界');
+    assert.strictEqual(r3.suggestion.text.includes('<00:01.000>'), true);
+    assert.strictEqual(r3.suggestion.text.includes('<00:01'), true);
+  }
+  // 「</b>，世界」中，标签不掩盖其后闭合标点的禁则
+  const r4 = suggestWrap('你好</b>，世界啊', 7);
+  assert.strictEqual(r4.ok, true);
+  if (r4.ok) {
+    assert.strictEqual(r4.suggestion.text, '你好</b>，\n世界啊');
+    assert.ok(!r4.suggestion.text.split('\n')[1].startsWith('，'));
+  }
+  ok('智能分行：标签原子且不计宽，禁则按可见字素判断');
+}
+
+// 43. 已满足约束（≤2 行且每行不超宽、断点合法）→ 保持原文
+{
+  const a = suggestWrap('短', 20);
+  assert.strictEqual(a.ok && a.suggestion.text, '短');
+  const b = suggestWrap('你好\n世界', 20);
+  assert.strictEqual(b.ok && b.suggestion.text, '你好\n世界');
+  const c = suggestWrap('ab\ncd', 20);
+  assert.strictEqual(c.ok && c.suggestion.text, 'ab\ncd');
+
+  // 既有某行超宽 → 重新规划：删除旧换行、在更优处增换行
+  const d = suggestWrap('你好世界啊\n嗯', 6); // 共 12
+  assert.strictEqual(d.ok, true);
+  if (d.ok) assert.strictEqual(d.suggestion.text, '你好世\n界啊嗯');
+
+  // 既有断点违反禁则 → 删除该断点（单行放得下时并为一行）
+  const e = suggestWrap('你好\n，世界', 20);
+  assert.strictEqual(e.ok, true);
+  if (e.ok) assert.strictEqual(e.suggestion.text, '你好，世界');
+  ok('智能分行：已满足保持原文，否则增删换行');
+}
+
+// 44. 单行即可放下时删除多余换行（如原文本超过两行）
+{
+  const r = suggestWrap('你好\n世界\n啊', 20);
+  assert.strictEqual(r.ok, true);
+  if (r.ok) {
+    assert.strictEqual(r.suggestion.text, '你好世界啊');
+    assert.deepStrictEqual(r.suggestion.lineWidths, [10, 0]);
+  }
+  ok('智能分行：单行放得下时删除多余换行');
+}
+
+// 45. 无解：超过两行
+{
+  const r = suggestWrap('哈'.repeat(20), 12); // 宽 40 > 2×12
+  assert.strictEqual(r.ok, false);
+  if (!r.ok) assert.ok(r.reason.includes('两行'));
+  ok('智能分行：超过两行标出无解原因');
+}
+
+// 46. 无解：单字素超宽；ASCII 在字素边界可断
+{
+  const r = suggestWrap('你好', 1); // 宽字素宽度 2 > 1
+  assert.strictEqual(r.ok, false);
+  if (!r.ok) {
+    assert.ok(r.reason.includes('字素'));
+    assert.ok(r.reason.includes('你'));
+  }
+  const r2 = suggestWrap('ab', 1);
+  assert.strictEqual(r2.ok, true);
+  if (r2.ok) {
+    assert.strictEqual(r2.suggestion.text, 'a\nb');
+    assert.deepStrictEqual(r2.suggestion.lineWidths, [1, 1]);
+  }
+  ok('智能分行：单字素超宽标出原因，ASCII 按字素边界断');
+}
+
+// 47. 无解：标点禁则导致无合法断点
+{
+  const r = suggestWrap('（（', 2); // 唯一断点会把「（」留在行尾
+  assert.strictEqual(r.ok, false);
+  if (!r.ok) assert.ok(r.reason.includes('标点禁则'));
+  ok('智能分行：标点禁则导致无合法断点');
+}
+
+// 48. 批量规划：只处理未锁定片段，分类正确，输入不被修改
+{
+  const cs: Cue[] = [
+    cueObj('a', '大家好欢迎收看本期节目'),
+    cueObj('b', '短'),
+    cueObj('c', '哈'.repeat(20)), // 宽 40 > 2×12 无解
+    cueObj('d', '锁定锁定锁定锁定锁定锁定', true), // 锁定：跳过
+  ];
+  const snapshot = JSON.parse(JSON.stringify(cs));
+  const plan = planSmartWrap(cs, 12);
+  assert.deepStrictEqual(plan.changes.map((x) => x.id), ['a']);
+  assert.strictEqual(plan.changes[0].suggested, '大家好欢迎\n收看本期节目');
+  assert.deepStrictEqual(plan.kept, ['b']);
+  assert.deepStrictEqual(plan.failures.map((x) => x.id), ['c']);
+  assert.ok(plan.failures[0].reason.includes('两行'));
+  assert.strictEqual(plan.lockedSkipped, 1);
+  assert.deepStrictEqual(cs, snapshot);
+  ok('智能分行：批量仅处理未锁定片段，分类正确，输入不变');
+}
+
+// 49. 确认应用 + 导出往返：仅增删换行，其余字符/标签/时间码/cue 设置/标识符保留
+{
+  const v = `WEBVTT
+
+NOTE 保留头
+
+cid-9
+00:01.000 --> 00:04.000 line:90% align:middle
+他说《红楼》好
+`;
+  const p = parseVTT(v);
+  assert.ok(!p.error, p.error);
+  const plan = planSmartWrap(p.cues, 8);
+  assert.strictEqual(plan.changes.length, 1);
+  const applied = p.cues.map((c) =>
+    c.id === plan.changes[0].id ? { ...c, text: plan.changes[0].suggested } : c,
+  );
+  const out = serializeVTT(applied, p.preamble);
+  assert.ok(out.includes('NOTE 保留头'));
+  assert.ok(out.includes('cid-9'));
+  assert.ok(out.includes('00:01.000 --> 00:04.000 line:90% align:middle'));
+  assert.ok(out.includes('他说《红\n楼》好'));
+  const re = parseVTT(out);
+  assert.ok(!re.error, re.error);
+  assert.strictEqual(re.cues.length, 1);
+  assert.strictEqual(re.cues[0].text, '他说《红\n楼》好');
+  assert.strictEqual(re.cues[0].identifier, 'cid-9');
+  assert.strictEqual(re.cues[0].settings, 'line:90% align:middle');
+  assert.strictEqual(re.cues[0].start, 1);
+  assert.strictEqual(re.cues[0].end, 4);
+  ok('智能分行：应用后导出保留标识符/设置/时间码/文件头，换行写入且可往返');
+}
+
+// 50. 幂等性与确定性：建议文本再次规划保持不变，重复求解结果一致
+{
+  const cases: Array<[string, number]> = [
+    ['大家好欢迎收看本期节目', 12],
+    ['hello world', 8],
+    ['他说《红楼》好', 8],
+    ['<b>你好世界</b>', 5],
+    ['你好世界啊\n嗯', 6],
+  ];
+  for (const [t, w] of cases) {
+    const r1 = suggestWrap(t, w);
+    const r3 = suggestWrap(t, w);
+    assert.ok(r1.ok);
+    assert.ok(r3.ok);
+    if (r1.ok && r3.ok) {
+      const r2 = suggestWrap(r1.suggestion.text, w);
+      assert.ok(r2.ok);
+      if (r2.ok) assert.strictEqual(r2.suggestion.text, r1.suggestion.text);
+      assert.strictEqual(r3.suggestion.text, r1.suggestion.text);
+    }
+  }
+  ok('智能分行：建议幂等且求解确定');
 }
 
 console.log(`\n全部 ${passed} 组测试通过 ✅`);

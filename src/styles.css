@@ -511,6 +511,43 @@ button.mini.danger:hover { color: var(--error); border-color: var(--error); }
 .excerpt-orig { margin-bottom: 3px; }
 .excerpt-body { font-size: 12.5px; }
 
+/* ---------- Smart wrap ---------- */
+.wrap-panel .row { margin-bottom: 8px; }
+.wrap-width-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wrap-width-input { width: 80px; }
+.wrap-list { max-height: 320px; overflow-y: auto; }
+.wrap-fail-list { max-height: 180px; overflow-y: auto; }
+.wrap-row { cursor: pointer; }
+.wrap-row.changed { border-left: 3px solid var(--ok); }
+.wrap-row.failed { border-left: 3px solid var(--error); }
+.wrap-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+  font-size: 12.5px;
+}
+.wrap-text.orig { color: var(--muted); }
+.wrap-text.suggested { color: #b8f4dc; }
+.wrap-label {
+  display: inline-block;
+  min-width: 28px;
+  color: var(--muted);
+  font-size: 10.5px;
+  margin-right: 2px;
+}
+.wrap-widths {
+  font-size: 10.5px;
+  color: var(--accent);
+  background: rgba(79, 140, 255, .12);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.wrap-reason {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--error);
+}
+
 /* ---------- Inspector ---------- */
 .inspector .row { margin-bottom: 10px; }
 .chk { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
